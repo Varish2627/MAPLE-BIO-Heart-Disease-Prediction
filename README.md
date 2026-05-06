@@ -27,7 +27,7 @@ pip install torchvision torchaudio
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/Varish2627/Heart-Disease-Detection.git
+   git clone https://github.com/sabitha9492098190/Heart-Disease-Detection.git
    cd Heart-Disease-Detection
    ```
 
