@@ -3,23 +3,24 @@ print("   Cardiovascular Heart Disease Dataset")
 print(" *** *** *** *** **** **** *** *** **** ")
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
+import os
+# Windows 11 no longer includes WMIC; provide joblib a deterministic core count.
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer
 from sklearn.utils import resample
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neighbors import LocalOutlierFactor, NearestNeighbors
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import random
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
-import seaborn as sns
-import os
 
 DATASET_NAME = "Cardiovascular"  
 
@@ -60,8 +61,7 @@ class MED_CARE:
     # -------------------------------
     def feature_engineering(self, df):
         df = df.copy()
-        if 'id' in df.columns:
-            df = df.drop(columns=['id'])
+        df = df.drop(columns=['id', 'patientid'], errors='ignore')
 
         if 'age' in df.columns:
             if df['age'].max() > 100:
@@ -99,7 +99,7 @@ class MED_CARE:
     # -------------------------------
     def normalize(self, df, target_col):
         features = df.drop(columns=[target_col])
-        scaled = self.scaler.fit_transform(features)
+        scaled = MinMaxScaler().fit_transform(features)
         df_scaled = pd.DataFrame(scaled, columns=features.columns)
         df_scaled[target_col] = df[target_col].values
         print("Normalization done.")
@@ -116,15 +116,36 @@ class MED_CARE:
             print("Dataset is already balanced.")
             return df.sample(frac=1).reset_index(drop=True)
 
-        minority_upsampled = resample(
-            minority,
-            replace=True,
-            n_samples=len(majority),
-            random_state=42
+        feature_cols = [col for col in df.columns if col != target_col]
+        samples_needed = len(majority) - len(minority)
+        training_medians = df[feature_cols].median()
+        minority = minority.copy()
+        minority[feature_cols] = (
+            minority[feature_cols]
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(training_medians)
+            .fillna(0)
         )
+        if len(minority) < 2:
+            synthetic = minority.sample(n=samples_needed, replace=True, random_state=42)
+        else:
+            neighbors = NearestNeighbors(n_neighbors=min(5, len(minority))).fit(minority[feature_cols])
+            neighbor_idx = neighbors.kneighbors(minority[feature_cols], return_distance=False)
+            rng = np.random.default_rng(42)
+            synthetic_rows = []
+            for _ in range(samples_needed):
+                source_idx = rng.integers(len(minority))
+                candidate_idx = neighbor_idx[source_idx][1:]
+                neighbor = minority.iloc[rng.choice(candidate_idx)]
+                source = minority.iloc[source_idx]
+                alpha = rng.random()
+                row = source.copy()
+                row[feature_cols] = source[feature_cols] + alpha * (neighbor[feature_cols] - source[feature_cols])
+                synthetic_rows.append(row)
+            synthetic = pd.DataFrame(synthetic_rows, columns=df.columns)
 
-        df_balanced = pd.concat([majority, minority_upsampled])
-        print("Class imbalance handled.")
+        df_balanced = pd.concat([majority, minority, synthetic], ignore_index=True)
+        print("Class imbalance handled using BIO-SYN interpolation.")
         return df_balanced.sample(frac=1).reset_index(drop=True)
 
 
@@ -132,34 +153,25 @@ class MED_CARE:
 # CLARITY-OD (Outlier Detection)
 # ===============================
 class CLARITY_OD:
-    def __init__(self, threshold=1.5):
-        self.threshold = threshold
+    def __init__(self, contamination=0.05, n_neighbors=20):
+        self.contamination = contamination
+        self.n_neighbors = n_neighbors
 
-    def detect_and_treat(self, df, target_col):
+    def detect_and_treat_train(self, df, target_col):
+        """Detect and replace LOF outliers using training data only."""
         df_clean = df.copy()
-        numeric_cols = [
-            col for col in df.select_dtypes(include=np.number).columns
-            if col != target_col and df[col].nunique() > 10
-        ]
+        feature_cols = [col for col in df.columns if col != target_col]
+        n_neighbors = min(self.n_neighbors, len(df_clean) - 1)
+        if len(df_clean) < 3 or n_neighbors < 2:
+            return df_clean
 
-        for col in numeric_cols:
-            Q1 = df[col].quantile(0.25)
-            Q3 = df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            if IQR == 0:
-                continue
+        lof = LocalOutlierFactor(n_neighbors=n_neighbors, contamination=self.contamination)
+        outlier_mask = lof.fit_predict(df_clean[feature_cols]) == -1
+        if outlier_mask.any():
+            medians = df_clean.loc[~outlier_mask, feature_cols].median()
+            df_clean.loc[outlier_mask, feature_cols] = medians.to_numpy()
 
-            lower_bound = Q1 - self.threshold * IQR
-            upper_bound = Q3 + self.threshold * IQR
-            median_val = df[col].median()
-
-            df_clean[col] = np.where(
-                (df[col] < lower_bound) | (df[col] > upper_bound),
-                median_val,
-                df[col]
-            )
-
-        print("Outliers detected and treated using CLARITY-OD.")
+        print(f"CLARITY-OD treated {outlier_mask.sum()} training outliers using LOF.")
         return df_clean
 
 
@@ -173,17 +185,10 @@ def run_medcare_pipeline(csv_path, target_col="cardio"):
     # Step 1: Load
     df = medcare.load_data(csv_path)
 
-    # Step 2: Missing values
-    df = medcare.handle_missing(df)
-
     # Step 3: Feature engineering
     df = medcare.feature_engineering(df)
 
-    # Step 4: Outlier detection
-    df = clarity.detect_and_treat(df, target_col)
-
-    # Step 5: Noise Reduction
-    df = medcare.noise_reduction(df, target_col)
+    # Outlier detection is deferred until after the train/test split.
 
     print("MED-CARE preprocessing completed ✅")
     return df
@@ -233,7 +238,7 @@ def train_vistanet(model, X_train, y_train, X_val=None, y_val=None, epochs=10, b
             optimizer.step()
             total_loss += loss.item() * xb.size(0)
 
-        avg_loss = total_loss / len(train_dataset) - 0.4
+        avg_loss = total_loss / len(train_dataset)
 
         model.eval()
         with torch.no_grad():
@@ -252,36 +257,59 @@ def train_vistanet(model, X_train, y_train, X_val=None, y_val=None, epochs=10, b
 # ===============================
 # VISTA-Net: Transformer Feature Extractor
 # ===============================
+class MPAN(nn.Module):
+    """Multi-parallel attention and gated feature fusion."""
+    def __init__(self, input_dim, embed_dim, num_heads, dropout):
+        super().__init__()
+        self.embedding = nn.Linear(1, embed_dim)
+        self.long_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.short_score = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.Tanh(), nn.Linear(embed_dim, 1))
+        self.short_mlp = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.ReLU(), nn.Dropout(dropout))
+        self.long_mlp = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.ReLU(), nn.Dropout(dropout))
+        self.gate = nn.Linear(2 * embed_dim, embed_dim)
+
+    def forward(self, x):
+        tokens = self.embedding(x.unsqueeze(-1))
+        weights = torch.softmax(self.short_score(tokens).squeeze(-1), dim=1)
+        short = (weights.unsqueeze(-1) * tokens).sum(dim=1)
+        long_tokens, _ = self.long_attention(tokens, tokens, tokens)
+        long = long_tokens.mean(dim=1)
+        short, long = self.short_mlp(short), self.long_mlp(long)
+        gate = torch.sigmoid(self.gate(torch.cat([short, long], dim=-1)))
+        return gate * short + (1 - gate) * long
+
+
 class VISTANet(nn.Module):
     def __init__(self, input_dim, embed_dim=64, num_heads=4, dropout=0.1):
         super().__init__()
-
         self.embedding = nn.Linear(1, embed_dim)
-        self.pos_embedding = nn.Parameter(torch.randn(1, input_dim, embed_dim))
-        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(embed_dim, embed_dim)
+        position = torch.arange(input_dim).unsqueeze(1)
+        divisor = torch.exp(torch.arange(0, embed_dim, 2) * (-np.log(10000.0) / embed_dim))
+        positional = torch.zeros(input_dim, embed_dim)
+        positional[:, 0::2], positional[:, 1::2] = torch.sin(position * divisor), torch.cos(position * divisor)
+        self.register_buffer("pos_embedding", positional.unsqueeze(0))
+        self.feature_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.context_attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm1, self.norm2, self.norm3 = nn.LayerNorm(embed_dim), nn.LayerNorm(embed_dim), nn.LayerNorm(embed_dim)
+        self.fusion = nn.Linear(2 * embed_dim, embed_dim)
+        self.mlp = nn.Sequential(nn.Linear(embed_dim, 2 * embed_dim), nn.GELU(), nn.Dropout(dropout), nn.Linear(2 * embed_dim, embed_dim))
+        self.flat_projection = nn.Linear(input_dim * embed_dim, embed_dim)
+        self.mpan = MPAN(embed_dim, embed_dim, num_heads, dropout)
         self.classifier = nn.Linear(embed_dim, 2)
-        self.attn_weights = None
 
     def forward(self, x, return_features=False):
-        x = x.unsqueeze(-1)
-        x = self.embedding(x)
-        x = x + self.pos_embedding
-        x = self.layer_norm(x)
-
-        attn_output, attn_weights = self.attention(x, x, x)
-        self.attn_weights = attn_weights
-
-        x = torch.mean(attn_output, dim=1)
-        x = self.dropout(x)
-        features = self.fc(x)
+        tokens = self.embedding(x.unsqueeze(-1)) + self.pos_embedding
+        spatial, _ = self.feature_attention(tokens, tokens, tokens)
+        spatial = self.norm1(tokens + spatial)
+        # Cross-sectional records have no visit-time axis; this parallel branch
+        # learns complementary feature-context dependencies rather than time dynamics.
+        contextual, _ = self.context_attention(spatial, spatial, spatial)
+        contextual = self.norm2(spatial + contextual)
+        fused = self.fusion(torch.cat([spatial, contextual], dim=-1))
+        fused = self.norm3(fused + self.mlp(fused))
+        features = self.mpan(self.flat_projection(fused.flatten(start_dim=1)))
         logits = self.classifier(features)
-
-        if return_features:
-            return features, logits
-        return logits
+        return (features, logits) if return_features else logits
 
     def extract_features(self, x):
         self.eval()
@@ -289,57 +317,6 @@ class VISTANet(nn.Module):
             features, _ = self.forward(x, return_features=True)
         return features
 
-
-def plot_attention_map(model, X_sample):
-
-    model.eval()
-
-    with torch.no_grad():
-        model(X_sample[:1])
-
-    attn = model.attn_weights
-    if attn is None:
-        raise ValueError("Attention weights are not available. Run the model on sample input first.")
-
-    attn = attn.detach().cpu().numpy()
-    if attn.ndim == 4:
-        attn = np.mean(attn, axis=1)[0]
-    elif attn.ndim == 3:
-        attn = np.mean(attn, axis=0)
-
-    plt.figure(figsize=(8, 6), dpi=600)
-
-    plt.imshow(attn, cmap='viridis')
-
-
-    plt.title("VISTA-Net Attention Map",
-              fontsize=20, fontweight='bold', fontname='Times New Roman')
-
-    plt.xlabel("Features",
-               fontsize=18, fontweight='bold', fontname='Times New Roman')
-
-    plt.ylabel("Features",
-               fontsize=18, fontweight='bold', fontname='Times New Roman')
-
-    plt.xticks(fontsize=16, fontweight='bold', fontname='Times New Roman')
-    plt.yticks(fontsize=16, fontweight='bold', fontname='Times New Roman')
-
-    cbar = plt.colorbar()
-    cbar.ax.tick_params(labelsize=16)
-    for label in cbar.ax.get_yticklabels():
-        label.set_fontname('Times New Roman')
-        label.set_fontweight('bold')
-
-    attn_path = os.path.join(
-        RESULT_DIR,
-        "vista_attention_map.png"
-    )
-    plt.tight_layout()
-    
-    plt.savefig(attn_path, dpi=600, bbox_inches='tight')
-    print("Saved:", attn_path)
-    
-    plt.show()
 
 class MAPLE_Predictor:
     def __init__(self, params=None):
@@ -351,7 +328,7 @@ class MAPLE_Predictor:
         self.rf = RandomForestClassifier(
             n_estimators=int(params.get("rf_n", 100)),
             max_depth=int(params.get("rf_depth", 5)),
-            n_jobs=-1,
+            n_jobs=1,
             random_state=42,
             class_weight="balanced"
         )
@@ -525,100 +502,18 @@ class EN_BUILD_Optimizer:
         print("\nBest Params:", best_params)
         return best_params
     
-def plot_optimization(history):
-    iterations = 50
-    base_curve = 1.2 * np.exp(-0.08 * np.arange(iterations)) + 0.1
-    noise = np.random.normal(0, 0.015, iterations)
-    oscillation = 0.03 * np.sin(0.4 * np.arange(iterations))
-    opt_curve = base_curve + noise + oscillation
-    opt_curve[-10:] += np.linspace(0.005, 0.02, 10)
-    opt_curve = np.clip(opt_curve, 0.05, None)
-    plt.figure(figsize=(6,4), dpi=600)
-    
-    plt.plot(opt_curve, linewidth=2.5,color='#fb3640')
-    
-    plt.title('Optimization Convergence',
-              fontsize=22, fontweight='bold', family='Times New Roman')
-    
-    plt.xlabel('Iterations',
-               fontsize=20, fontweight='bold', family='Times New Roman')
-    
-    plt.ylabel('Objective Value',
-               fontsize=20, fontweight='bold', family='Times New Roman')
-    
-    plt.xticks(fontsize=18, fontweight='bold', family='Times New Roman')
-    plt.yticks(fontsize=18, fontweight='bold', family='Times New Roman')
-    
-    ax = plt.gca()
-    for spine in ax.spines.values():
-        spine.set_linewidth(1.2)
-    
-    plt.tight_layout()
-    opt_path = os.path.join(RESULT_DIR, f"{DATASET_NAME}_optimization_curve.png")
-
-    plt.savefig(opt_path, dpi=600, bbox_inches='tight')
-    print("Saved:", opt_path)
-    plt.show()
-
-    
-def plt_feature_importance(file_path, top_n=None):
-    df = pd.read_csv(file_path, sep=';')
-    df['age_years'] = df['age'] / 365
-    df['bmi'] = df['weight'] / ((df['height'] / 100) ** 2)
-    df = df.drop(columns=['id'], errors='ignore')
-    df = df.dropna()
-    X = df.drop(columns=['cardio'])
-    y = df['cardio']
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
-    model.fit(X, y)
-    importances = model.feature_importances_
-    feature_names = np.array(X.columns)
-    indices = np.argsort(importances)[::-1]
-    if top_n is not None:
-        indices = indices[:top_n]
-    sorted_features = feature_names[indices]
-    sorted_importances = importances[indices]
-
-    colors = plt.cm.coolwarm(np.linspace(0, 1, len(sorted_features)))
-
-    fig, ax = plt.subplots(figsize=(7, 4), dpi=600)
-
-    ax.barh(sorted_features, sorted_importances, color=colors)
-    ax.invert_yaxis()
-
-    ax.set_xlabel("Importance Score", fontsize=12, fontweight='bold', fontname='Times New Roman')
-    ax.set_title("Feature Importance", fontsize=16, fontweight='bold', fontname='Times New Roman')
-
-    ax.set_yticks(range(len(sorted_features)))
-    ax.set_yticklabels(sorted_features, fontsize=10, fontweight='bold', fontname='Times New Roman')
-
-    ax.tick_params(axis='x', labelsize=10)
-    for label in ax.get_xticklabels():
-        label.set_fontweight('bold')
-        label.set_fontname('Times New Roman')
-
-    plt.tight_layout()
-    fi_path = os.path.join(RESULT_DIR, f"{DATASET_NAME}_feature_importance.png")
-    
-    plt.savefig(fi_path, dpi=600, bbox_inches='tight')
-    print("Saved:", fi_path)
-
-    plt.show()
-
-    
 # ===============================
 # RUN
 # ===============================
 
-datasets = [
-        ("Datasets/Cardiovascular Heart Disease Dataset.csv", "cardio")]
+datasets = [("Datasets/Cardiovascular_Disease_Dataset.csv", "target")]
 
 for csv_path, target_col in datasets:
         print(f"\n=== Processing {csv_path} ===")
         
         np.random.seed(42)
 
-        df = pd.read_csv("Datasets/Cardiovascular Heart Disease Dataset.csv", sep=';')
+        df = pd.read_csv("Datasets/Cardiovascular_Disease_Dataset.csv")
         
         X = df.iloc[:, :-1]
         y = df.iloc[:, -1]
@@ -635,10 +530,23 @@ for csv_path, target_col in datasets:
 
         X_train, X_test, y_train, y_test = prepare_tensor_data(df, target_col)
 
+        # Fit missing-value treatment on development data only.
+        imputer = SimpleImputer(strategy='median')
+        X_train = imputer.fit_transform(X_train)
+        X_test = imputer.transform(X_test)
+
         # ---------------------------
-        # NORMALIZATION 
+        # CLARITY-OD: LOF detection and median treatment on training data only.
+        feature_cols = df.drop(columns=[target_col]).columns
+        train_df = pd.DataFrame(X_train, columns=feature_cols)
+        train_df[target_col] = y_train
+        train_df = CLARITY_OD().detect_and_treat_train(train_df, target_col)
+        X_train = train_df.drop(columns=[target_col]).values
+        y_train = train_df[target_col].values
+
+        # MED-NORM normalization, fitted on training data only.
         # ---------------------------
-        scaler = StandardScaler()
+        scaler = MinMaxScaler()
         X_train = scaler.fit_transform(X_train)
         X_test = scaler.transform(X_test)
 
@@ -695,15 +603,11 @@ for csv_path, target_col in datasets:
 
         feature_names = [f"VISTA_{i}" for i in range(X_train_feat.shape[1])]
 
-        plot_attention_map(feature_extractor, X_train)
-
         # ---------------------------
         # OPTIMIZATION
         # ---------------------------
         optimizer = EN_BUILD_Optimizer(pop_size=3, iterations=50)
         best_params = optimizer.optimize(X_train_feat, y_train_np)
-
-        plot_optimization(optimizer.history)
 
         # ---------------------------
         # FINAL MODEL
@@ -711,137 +615,8 @@ for csv_path, target_col in datasets:
         predictor = MAPLE_Predictor(best_params)
         predictor.train(X_train_feat, y_train_np)
 
-        plt_feature_importance(csv_path)
-        
         acc = predictor.evaluate(X_test_feat, y_test_np)
-        print(f"Final Test Accuracy for {csv_path}: {acc:.4f}")
 
         y_pred = predictor.predict(X_test_feat)
 
-        print(classification_report(y_test_np, y_pred))
-        
-        y_pred = y_test_.copy()
-
-        classes = y.unique()
-
-        class_0_idx = np.where(y_test_ == classes[0])[0]
-        class_1_idx = np.where(y_test_ == classes[1])[0]
-
-        n_err_class0 = int(0.005 * len(class_0_idx))   
-        n_err_class1 = int(0.02 * len(class_1_idx))  
-
-        err_idx_0 = np.random.choice(class_0_idx, n_err_class0, replace=False)
-        err_idx_1 = np.random.choice(class_1_idx, n_err_class1, replace=False)
-
-        for i in err_idx_0:
-            y_pred.iloc[i] = classes[1]
-
-        for i in err_idx_1:
-            y_pred.iloc[i] = classes[0]
-
-
-        cm = confusion_matrix(y_test_, y_pred)
-        acc = accuracy_score(y_test_, y_pred)
-        print(f"Accuracy : {acc}")
-        plt.figure(figsize=(6,5), dpi=600)
-
-        ax = sns.heatmap(
-            cm,
-            annot=True,
-            fmt='d',
-            cmap='PuRd',
-            cbar=False,
-            xticklabels=np.unique(y),
-            yticklabels=np.unique(y),
-            annot_kws={"size":20, "weight":"bold", "family":"Times New Roman"}
-        )
-
-        plt.title('Confusion Matrix',
-                  fontsize=24, fontweight='bold', family='Times New Roman')
-        plt.xlabel('Predicted Label', fontsize=22, fontweight='bold', family='Times New Roman')
-        plt.ylabel('True Label', fontsize=22, fontweight='bold', family='Times New Roman')
-
-        plt.xticks(fontsize=20, fontweight='bold', family='Times New Roman')
-        plt.yticks(fontsize=20, fontweight='bold', family='Times New Roman')
-
-        for spine in ax.spines.values():
-            spine.set_visible(True)
-            spine.set_linewidth(1.2)
-        cm_path = os.path.join(RESULT_DIR, f"{DATASET_NAME}_confusion_matrix.png")
-        
-        plt.savefig(cm_path, dpi=600, bbox_inches='tight')
-        print("Saved:", cm_path)
-        plt.tight_layout()
-        plt.show()
-
-        print("\n===== CLASSIFICATION REPORT =====\n")
-        print(classification_report(y_test_, y_pred))
-
-        report = classification_report(y_test_, y_pred, output_dict=True)
-        report_df = pd.DataFrame(report).transpose()
-
-        class_labels = sorted([str(c) for c in np.unique(y_test_)])
-
-        precision = [report_df.loc[c, 'precision'] for c in class_labels]
-        recall    = [report_df.loc[c, 'recall'] for c in class_labels]
-        f1        = [report_df.loc[c, 'f1-score'] for c in class_labels]
-        support   = [report_df.loc[c, 'support'] for c in class_labels]
-
-        x = np.arange(len(classes))
-        width = 0.25
-
-        plt.figure(figsize=(7,5), dpi=600)
-
-        bars1 = plt.bar(x - width, precision, width, label='Precision', color='#4C72B0')
-        bars2 = plt.bar(x, recall, width, label='Recall', color='#55A868')
-        bars3 = plt.bar(x + width, f1, width, label='F1-score', color='#C44E52')
-
-        plt.xlabel("Class", fontsize=22, fontweight='bold', family='Times New Roman')
-        plt.ylabel("Score", fontsize=22, fontweight='bold', family='Times New Roman')
-
-        plt.title("Class-wise Performance Metrics",
-                  fontsize=24, fontweight='bold', family='Times New Roman')
-
-        plt.xticks(x, classes, fontsize=20, fontweight='bold', family='Times New Roman')
-        plt.yticks(fontsize=20, fontweight='bold', family='Times New Roman')
-
-        plt.ylim(0.96, 1.01)
-
-        def add_labels(bars):
-            for bar in bars:
-                height = bar.get_height()
-                plt.text(
-                    bar.get_x() + bar.get_width()/2,
-                    height + 0.002,
-                    f'{height:.2f}',
-                    ha='center',
-                    fontsize=18,
-                    fontweight='bold',
-                    family='Times New Roman'
-                )
-
-        add_labels(bars1)
-        add_labels(bars2)
-        add_labels(bars3)
-
-        legend = plt.legend(frameon=True)
-        for text in legend.get_texts():
-            text.set_fontsize(18)
-            text.set_fontweight('bold')
-            text.set_family('Times New Roman')
-
-        ax = plt.gca()
-        for spine in ax.spines.values():
-            spine.set_linewidth(1.2)
-        save_path = os.path.join(
-            RESULT_DIR,
-            f"{DATASET_NAME}_classwise_metrics.png"
-        )
-        plt.tight_layout()
-        
-        plt.savefig(save_path, dpi=600, bbox_inches='tight')
-        print(f"Saved plot → {save_path}")
-        
-        plt.show()
-        import Cardiovascular_graph
-        import cleveland 
+import cleveland
