@@ -1,54 +1,79 @@
 # Heart Disease Detection
 
-This project implements heart disease detection using machine learning models on multiple datasets.
+This project implements a machine learning pipeline for heart disease prediction using multiple datasets, including a cardiovascular dataset and the Cleveland heart disease dataset. The workflow covers preprocessing, feature engineering, outlier handling, class balancing, model training, and result visualization.
+
+## Overview
+
+The repository contains:
+- `Main.py` — main processing pipeline for the cardiovascular dataset
+- `cleveland.py` — equivalent pipeline for the Cleveland dataset
+- `Graph.py` — visualization script for plotting charts and model-performance outputs
+- `metrics` — metrics and result metadata used by the graph generation logic
+- `Datasets/` — source CSV datasets
+- `results/` — generated plots, confusion matrices, and evaluation visuals
 
 ## Datasets
 
-The project uses the following datasets (included in the `Datasets/` folder):
-- Cardiovascular Heart Disease Dataset.csv
-- heart_cleveland_upload.csv
+The project uses these datasets from the `Datasets/` folder:
+- `Cardiovascular_Disease_Dataset.csv`
+- `heart_cleveland_upload.csv`
 
 ## Requirements
 
-Install the following Python packages:
+Install the required Python libraries before running the project:
 
 ```bash
-pip install numpy
-pip install pandas
-pip install tqdm
-pip install matplotlib
-pip install scikit-learn
-pip install seaborn
-pip install torch
-pip install torchvision torchaudio
+pip install numpy pandas tqdm matplotlib scikit-learn seaborn torch torchvision torchaudio
 ```
 
 ## How to Run
 
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/sabitha9492098190/Heart-Disease-Detection.git
-   cd Heart-Disease-Detection
-   ```
 
-2. Install the required packages as listed above.
+```bash
+git clone https://github.com/Varish2627/Heart-Disease-Detection.git
+cd Heart-Disease-Detection
+```
 
-3. Run the main script:
-   ```bash
-   python Main.py
-   ```
+2. Install dependencies:
 
-Running `Main.py` will automatically process all datasets and generate results, including graphs and metrics, saved in the `results/` folder.
+```bash
+pip install numpy pandas tqdm matplotlib scikit-learn seaborn torch torchvision torchaudio
+```
+
+3. Run the main cardiovascular pipeline:
+
+```bash
+python Main.py
+```
+
+The scripts will preprocess the data, train the models, and save the generated outputs into the `results/` directory.
 
 ## Project Structure
 
-- `Main.py`: Main script for Cardiovascular dataset processing.
-- `cleveland.py`: Script for Cleveland dataset processing.
-- `Cardiovascular_graph.py`: Graph generation for Cardiovascular dataset.
-- `cleveland_graph.py`: Graph generation for Cleveland dataset.
-- `Datasets/`: Folder containing the dataset files.
-- `results/`: Folder where output graphs and metrics are saved.
+```text
+Heart-Disease-Detection/
+├── Main.py
+├── cleveland.py
+├── Graph.py
+├── metrics/
+├── Datasets/
+├── results/
+├── README.md
+├── .gitignore
+└── Instructions.docx
+```
 
-## Results
+## Outputs
 
-The scripts will generate various visualizations and performance metrics for heart disease prediction models.
+The project produces:
+- confusion matrices
+- model performance charts
+- feature importance plots
+- age distribution and correlation plots
+- normalization and attention-map visualizations
+- classification metrics saved under `results/`
+
+## Notes
+
+This project focuses on experimental biomedical ML workflows and is designed to help analyze risk factors associated with heart disease detection using tabular clinical datasets.
