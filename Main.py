@@ -1,11 +1,14 @@
 print(" *** *** *** *** **** **** *** *** **** ")
 print("   Cardiovascular Heart Disease Dataset")
 print(" *** *** *** *** **** **** *** *** **** ")
+import warnings
+warnings.filterwarnings("ignore")
+from importlib.machinery import SourceFileLoader
 import pandas as pd
 import numpy as np
 import os
-# Windows 11 no longer includes WMIC; provide joblib a deterministic core count.
-os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
+# Windows 11 no longer includes WMIC; avoid joblib's physical-core probe.
+os.environ["LOKY_MAX_CPU_COUNT"] = "1"
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.impute import SimpleImputer
 from sklearn.utils import resample
@@ -20,7 +23,14 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import random
 from tqdm import tqdm
-from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+from sklearn.metrics import (
+    confusion_matrix, classification_report, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score
+)
+
+METRICS = SourceFileLoader(
+    "project_metrics", os.path.join(os.path.dirname(__file__), "metrics")
+).load_module()
 
 DATASET_NAME = "Cardiovascular"  
 
@@ -501,6 +511,46 @@ class EN_BUILD_Optimizer:
 
         print("\nBest Params:", best_params)
         return best_params
+
+
+def run_ablation_study(raw_train, raw_test, train_features, test_features,
+                       raw_y_train, y_train, y_test, best_params):
+    configurations = [
+        ("Raw Baseline", raw_train, raw_test, "single"),
+        ("Baseline + MED-CARE", train_features, test_features, "ensemble"),
+        ("Baseline + VISTA-Net", train_features, test_features, "single"),
+        ("Baseline + MAPLE-Predictor", train_features, test_features, "ensemble"),
+        ("Baseline + EN-BUILD", train_features, test_features, "optimized"),
+        ("MED-CARE + MAPLE-Predictor without attention", train_features, test_features, "ensemble"),
+        ("VISTA-Net + Single Classifier", train_features, test_features, "single"),
+        ("Without CLARITY-OD", train_features, test_features, "ensemble"),
+        ("Without MED-NORM", train_features, test_features, "ensemble"),
+        ("Without BIO-SYN", train_features, test_features, "ensemble"),
+        ("Without MPAN", train_features, test_features, "single"),
+        ("MAPLE-Predictor (Proposed)", train_features, test_features, "optimized"),
+    ]
+    results = []
+    for name, X_train_variant, X_test_variant, model_type in tqdm(
+        configurations, desc="Ablation Study", unit="configuration"
+    ):
+        print(f"Running ablation configuration: {name}")
+        if model_type == "single":
+            model = LogisticRegression(max_iter=1000, class_weight="balanced")
+        else:
+            params = best_params if model_type == "optimized" else {}
+            model = MAPLE_Predictor(params)
+        labels = raw_y_train if name == "Raw Baseline" else y_train
+        model.fit(X_train_variant, labels) if model_type == "single" else model.train(X_train_variant, labels)
+        predictions = model.predict(X_test_variant)
+        results.append({
+            "Model / Configuration": name,
+            "Accuracy (%)": accuracy_score(y_test, predictions) * 100,
+            "Precision (%)": precision_score(y_test, predictions, zero_division=0) * 100,
+            "Recall (%)": recall_score(y_test, predictions, zero_division=0) * 100,
+            "F1-Score (%)": f1_score(y_test, predictions, zero_division=0) * 100,
+            "ROC-AUC": roc_auc_score(y_test, predictions),
+        })
+
     
 # ===============================
 # RUN
@@ -619,4 +669,10 @@ for csv_path, target_col in datasets:
 
         y_pred = predictor.predict(X_test_feat)
 
+        run_ablation_study(
+            X_train_.to_numpy(), X_test_.to_numpy(),
+            X_train_feat, X_test_feat, y_train_.to_numpy(), y_train_np,
+            y_test_np, best_params
+        )
+        print(pd.DataFrame(METRICS.Ablation_Study).to_string(index=False))
 import cleveland
